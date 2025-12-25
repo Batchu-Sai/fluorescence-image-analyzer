@@ -8,18 +8,21 @@ from PIL import Image
 def extract_clean_images_from_pptx(pptx_path, output_dir):
     """
     Extract images from PPTX, combining multiple images per slide into a single flattened image.
-    For slides with multiple images:
-    - If images are same size: composite them (max blend for overlays)
-    - If images are different sizes: stitch them together (horizontally or vertically)
+    Preserves the original layout and positioning of images on the slide.
     """
     os.makedirs(output_dir, exist_ok=True)
     prs = Presentation(pptx_path)
     extracted = []
+    
+    # Get slide dimensions (in EMU - English Metric Units)
+    # 1 inch = 914400 EMU
+    slide_width_emu = prs.slide_width
+    slide_height_emu = prs.slide_height
 
     for slide_idx, slide in enumerate(prs.slides, start=1):
-        slide_images = []
+        image_data_list = []  # List of (image_array, left, top, width, height) tuples
         
-        # Collect all images from this slide
+        # Collect all images from this slide with their positions
         for shape_idx, shape in enumerate(slide.shapes, start=1):
             if not shape.shape_type == 13:  # Skip if not a picture
                 continue
@@ -33,21 +36,31 @@ def extract_clean_images_from_pptx(pptx_path, output_dir):
                     # Convert to RGB if needed
                     if im.mode != 'RGB':
                         im = im.convert('RGB')
-                    slide_images.append(np.array(im))
+                    img_array = np.array(im)
+                    
+                    # Get shape position and size (in EMU)
+                    left_emu = shape.left
+                    top_emu = shape.top
+                    width_emu = shape.width
+                    height_emu = shape.height
+                    
+                    image_data_list.append((img_array, left_emu, top_emu, width_emu, height_emu))
             except Exception as e:
                 print(f"Skipping image from slide {slide_idx}: {e}")
                 continue
         
-        if not slide_images:
+        if not image_data_list:
             continue
         
         # Process slide images
-        if len(slide_images) == 1:
+        if len(image_data_list) == 1:
             # Single image: save as-is
-            combined_img = Image.fromarray(slide_images[0])
+            combined_img = Image.fromarray(image_data_list[0][0])
         else:
-            # Multiple images: combine them
-            combined_img = combine_slide_images(slide_images)
+            # Multiple images: combine them respecting original positions
+            combined_img = combine_slide_images_with_positions(
+                image_data_list, slide_width_emu, slide_height_emu
+            )
         
         # Save the combined image
         name = f"slide{slide_idx:02d}.png"
@@ -58,92 +71,96 @@ def extract_clean_images_from_pptx(pptx_path, output_dir):
     return extracted
 
 
-def combine_slide_images(images):
+def combine_slide_images_with_positions(image_data_list, slide_width_emu, slide_height_emu):
     """
-    Combine multiple images from a slide into a single image.
+    Combine multiple images from a slide into a single image, preserving their original positions.
     
-    Strategy:
-    1. If all images are the same size: composite using max blend (for overlays)
-    2. If different sizes: stitch horizontally or vertically based on dimensions
+    Parameters:
+        image_data_list: List of tuples (img_array, left_emu, top_emu, width_emu, height_emu)
+        slide_width_emu: Slide width in EMU units
+        slide_height_emu: Slide height in EMU units
+    
+    Returns:
+        PIL Image with all images placed at their original positions
     """
-    if not images:
+    if not image_data_list:
         raise ValueError("No images to combine")
     
-    if len(images) == 1:
-        return Image.fromarray(images[0])
+    if len(image_data_list) == 1:
+        return Image.fromarray(image_data_list[0][0])
     
-    # Get dimensions
-    heights = [img.shape[0] for img in images]
-    widths = [img.shape[1] for img in images]
+    # Convert EMU to pixels
+    # We'll use the actual image dimensions to determine the scale
+    # First, find a reference scale based on the first image
+    first_img, first_left, first_top, first_width_emu, first_height_emu = image_data_list[0]
+    first_img_height, first_img_width = first_img.shape[:2]
     
-    # Check if all images are the same size
-    if len(set(heights)) == 1 and len(set(widths)) == 1:
-        # Same size: composite using max blend (for overlays/channels)
-        h, w = heights[0], widths[0]
-        combined = np.zeros((h, w, 3), dtype=np.uint8)
-        
-        for img in images:
-            # Use maximum intensity for each pixel (good for fluorescence overlays)
-            combined = np.maximum(combined, img)
-        
-        return Image.fromarray(combined)
+    # Calculate pixels per EMU based on the first image
+    # This assumes the image was placed at its natural size
+    pixels_per_emu_height = first_img_height / first_height_emu if first_height_emu > 0 else 0
+    pixels_per_emu_width = first_img_width / first_width_emu if first_width_emu > 0 else 0
     
-    # Different sizes: stitch them together
-    # Determine if we should stitch horizontally or vertically
-    # by comparing total width vs total height
-    total_width = sum(widths)
-    total_height = sum(heights)
-    max_width = max(widths)
-    max_height = max(heights)
-    
-    # If images have similar heights, stitch horizontally
-    # If images have similar widths, stitch vertically
-    height_variance = np.var(heights) / (np.mean(heights) ** 2) if np.mean(heights) > 0 else 1
-    width_variance = np.var(widths) / (np.mean(widths) ** 2) if np.mean(widths) > 0 else 1
-    
-    if height_variance < width_variance and height_variance < 0.1:
-        # Similar heights: stitch horizontally
-        stitched = stitch_horizontally(images)
+    # Use average if both are valid, otherwise use the non-zero one
+    if pixels_per_emu_height > 0 and pixels_per_emu_width > 0:
+        pixels_per_emu = (pixels_per_emu_height + pixels_per_emu_width) / 2
+    elif pixels_per_emu_height > 0:
+        pixels_per_emu = pixels_per_emu_height
+    elif pixels_per_emu_width > 0:
+        pixels_per_emu = pixels_per_emu_width
     else:
-        # Stitch vertically
-        stitched = stitch_vertically(images)
+        # Fallback: assume standard DPI (96 DPI = 914400 EMU per inch)
+        # 1 inch = 96 pixels at 96 DPI, so 1 EMU = 96/914400 pixels
+        pixels_per_emu = 96.0 / 914400.0
     
-    return Image.fromarray(stitched)
+    # Calculate canvas size in pixels
+    canvas_width = int(slide_width_emu * pixels_per_emu)
+    canvas_height = int(slide_height_emu * pixels_per_emu)
+    
+    # Create canvas
+    canvas = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+    
+    # Place each image at its original position
+    for img_array, left_emu, top_emu, width_emu, height_emu in image_data_list:
+        # Convert positions to pixels
+        left_px = int(left_emu * pixels_per_emu)
+        top_px = int(top_emu * pixels_per_emu)
+        width_px = int(width_emu * pixels_per_emu)
+        height_px = int(height_emu * pixels_per_emu)
+        
+        # Resize image to match the shape's dimensions if needed
+        img_height, img_width = img_array.shape[:2]
+        if img_height != height_px or img_width != width_px:
+            # Resize to match the shape dimensions
+            img_pil = Image.fromarray(img_array)
+            img_pil = img_pil.resize((width_px, height_px), Image.Resampling.LANCZOS)
+            img_array = np.array(img_pil)
+            img_height, img_width = img_array.shape[:2]
+        
+        # Calculate placement bounds
+        x0 = max(0, left_px)
+        y0 = max(0, top_px)
+        x1 = min(canvas_width, left_px + img_width)
+        y1 = min(canvas_height, top_px + img_height)
+        
+        # Calculate source bounds (in case image extends beyond canvas)
+        src_x0 = max(0, -left_px)
+        src_y0 = max(0, -top_px)
+        src_x1 = src_x0 + (x1 - x0)
+        src_y1 = src_y0 + (y1 - y0)
+        
+        # Place image on canvas
+        if x1 > x0 and y1 > y0 and src_x1 > src_x0 and src_y1 > src_y0:
+            new_img = img_array[src_y0:src_y1, src_x0:src_x1]
+            existing = canvas[y0:y1, x0:x1]
+            
+            # Check if there's existing content at this exact position
+            if np.any(existing > 0) and existing.shape == new_img.shape:
+                # Same position and size: likely an overlay, use max blend (for fluorescence channels)
+                canvas[y0:y1, x0:x1] = np.maximum(existing, new_img)
+            else:
+                # No overlap or different sizes: place the image (may overwrite if overlapping)
+                # For non-overlapping images, this preserves their positions
+                canvas[y0:y1, x0:x1] = new_img
+    
+    return Image.fromarray(canvas)
 
-
-def stitch_horizontally(images):
-    """Stitch images horizontally, aligning to top."""
-    heights = [img.shape[0] for img in images]
-    widths = [img.shape[1] for img in images]
-    
-    max_height = max(heights)
-    total_width = sum(widths)
-    
-    stitched = np.zeros((max_height, total_width, 3), dtype=np.uint8)
-    x_offset = 0
-    
-    for img in images:
-        h, w = img.shape[0], img.shape[1]
-        stitched[:h, x_offset:x_offset+w] = img
-        x_offset += w
-    
-    return stitched
-
-
-def stitch_vertically(images):
-    """Stitch images vertically, aligning to left."""
-    heights = [img.shape[0] for img in images]
-    widths = [img.shape[1] for img in images]
-    
-    total_height = sum(heights)
-    max_width = max(widths)
-    
-    stitched = np.zeros((total_height, max_width, 3), dtype=np.uint8)
-    y_offset = 0
-    
-    for img in images:
-        h, w = img.shape[0], img.shape[1]
-        stitched[y_offset:y_offset+h, :w] = img
-        y_offset += h
-    
-    return stitched
